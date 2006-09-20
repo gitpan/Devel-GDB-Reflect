@@ -60,7 +60,7 @@ use Devel::GDB::Reflect::PrettyPrinter;
 use Data::Dumper;
 use Devel::GDB;
 
-our $VERSION   = '0.1';
+our $VERSION   = '0.2';
 our $MAX_DEPTH = 5;
 our $MAX_WIDTH = 10;
 our $INDENT    = 4;

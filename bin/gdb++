@@ -1,10 +1,32 @@
+#!/usr/bin/perl
+
 =head1 NAME
 
 gdb++ - GDB wrapper providing nice reflection features
 
 =head1 SYNOPSIS
 
-gdb++ PROGRAM
+ gdb++ [options] [executable-file [core-file or process-id]]
+ gdb++ [options] --args executable-file [inferior-arguments ...]
+
+=head2 OPTIONS
+
+=over
+
+=item B<--args>
+
+Pass all parameters after I<executable-file> to the program being debugged.
+
+=item B<-v>
+
+If STDIN is not a tty (e.g. it's a pipe), echo back the GDB prompt as well as
+the command being executed.
+
+=item B<-g> I<PATH>
+
+Specify the path to the gdb executable.  Defaults to C<gdb>.
+
+=back
 
 =head1 DESCRIPTION
 
@@ -89,14 +111,24 @@ container.  Defaults to 10.  Example:
 
 =cut
 
-#!/usr/bin/perl
-
 use warnings;
 use strict;
 
+use POSIX;
 use Devel::GDB::Reflect;
+use Devel::GDB::Reflect::MessageMethod qw( anon );
 use Devel::GDB;
 use Term::ReadLine;
+use Getopt::Long;
+use Pod::Usage;
+use String::ShellQuote;
+
+my $VERBOSE;
+my $FILE;
+my $CORE_FILE;
+my $ARGS;
+my $IS_TTY = -t STDIN;
+my $GDB    = "gdb";
 
 #
 # Map from parameter name (e.g. gdb_reflect_indent) to a variable ref
@@ -118,14 +150,59 @@ sub get_var($)
 	return undef;
 }
 
-die unless @ARGV;
+########################################################################
 
-my ($gdb, $bufs, $errs) = new Devel::GDB( -file => $ARGV[0] );
-my $reflector = new Devel::GDB::Reflect($gdb);
+##
+## Process the command line arguments
+##
 
-my $IS_TTY      = -t STDIN;
-my $VERBOSE     = 1;
+# Stop processing arguments after --args
+@ARGV = map { /^--args$/ ? ($_, q(--)) : $_ } @ARGV;
 
+GetOptions( 'v'    => \$VERBOSE,
+            'g=s'  => \$GDB,
+            'args' => \$ARGS )
+	or pod2usage();
+
+if(defined $ARGS)
+{
+	# Lift out $FILE
+	@ARGV = grep { defined($FILE) or /^-/ or $FILE = $_, 0 } @ARGV;
+	die "`--args' specified but no program specified" unless defined($FILE);
+}
+else
+{
+	pod2usage if @ARGV > 2;
+	($FILE, $CORE_FILE) = @ARGV;
+}
+
+my @preamble = ();
+
+push @preamble, shell_quote('file', $FILE)      if defined($FILE);
+push @preamble, shell_quote('core', $CORE_FILE) if defined($CORE_FILE);
+push @preamble, shell_quote('args', @ARGV)      if defined($ARGS);
+
+##
+## Start up GDB.  Work around a lack of proper signal handling in Devel::GDB
+## and actually inform the user if GDB dies unexpectedly (or even fails to
+## start up).
+##
+
+my ($gdb, $bufs, $errs);
+
+$SIG{CHLD} = sub
+{
+	wait;
+	return unless $?;
+
+	my $msg = defined($gdb) ? "GDB died unexpectedly" : "GDB failed to start";
+	$msg .= (", exit status was " . WEXITSTATUS($?)) if WIFEXITED($?);
+	$msg .= (", died with signal " . WTERMSIG($?)) if WIFSIGNALED($?);
+
+	die $msg;
+};
+
+($gdb, $bufs, $errs) = new Devel::GDB( -execfile => $GDB );
 print STDERR $bufs;
 
 if($errs)
@@ -134,6 +211,19 @@ if($errs)
 	die "Failed to start GDB";
 }
 
+foreach(@preamble)
+{
+	my($result, $error) = $gdb->get($_);
+	die "Error: $error" if($error);
+	print STDERR $result;
+}
+
+##
+## Set up our environment, and start the main loop
+##
+
+my $reflector = new Devel::GDB::Reflect($gdb);
+
 # Create a new ReadLine instance if we're reading from a TTY;
 # otherwise create a stub that behaves like ReadLine
 
@@ -141,7 +231,7 @@ my $term;
 
 if($IS_TTY)
 {
-	$term = new Term::ReadLine 'gdbwrap';
+	$term = new Term::ReadLine 'gdb++';
 	my $rl_attribs = $term->Attribs;
 
 	$rl_attribs->{completion_function} =
@@ -171,19 +261,15 @@ if($IS_TTY)
 }
 else
 {
-	$term = new MessageMethod sub
+	$term = anon
 	{
-		my $arg = shift;
-
-		({
-			readline => sub
-			{
-				my $prompt = shift;
-				print STDERR $prompt if $VERBOSE;
-				defined($_ = <STDIN>) and chomp $_ or undef;
-				return $_;
-			}
-		}->{$arg} || sub { die "Unknown request: $arg" })->(@_);
+		readline => sub
+		{
+			my $prompt = shift;
+			print STDERR $prompt if $VERBOSE;
+			defined($_ = <STDIN>) and chomp $_ or undef;
+			return $_;
+		}
 	};
 }
 
