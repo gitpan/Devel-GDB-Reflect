@@ -1,0 +1,248 @@
+=head1 NAME
+
+gdb++ - GDB wrapper providing nice reflection features
+
+=head1 SYNOPSIS
+
+gdb++ PROGRAM
+
+=head1 DESCRIPTION
+
+Devel::GDB::Reflect provides a reflection API for GDB/C++, which can
+be used to recursively print the contents of STL data structures
+(vector, set, map, etc.) within a GDB session.  It is not limited
+to STL, however; you can write your own delegates for printing custom
+container types.
+
+The module provides a script, "gdb++", which serves as a wrapper
+around GDB.  Invoke it the same way you would invoke gdb, e.g.:
+
+ $ gdb++ MYPROG
+
+Within the gdb++ session, you can execute the same commands as within
+gdb, with the following extensions:
+
+=over
+
+=item *
+
+C<print_r> I<VAR>
+
+Recursively prints the contents of VAR.  The command can be
+abbreviated as "pr".  For example, if "v" is of type
+vector< vector<int> >:
+
+        (gdb) pr v
+        [
+            [ 11, 12, 13 ], 
+            [ 21, 22, 23 ], 
+            [ 31, 32, 33 ]
+        ]
+
+=item *
+
+C<set gdb_reflect_indent> I<VALUE>
+
+=item *
+
+C<show gdb_reflect_indent>
+
+Set or show the number of spaces to indent at each level of
+recursion.  Defaults to 4.
+
+=item *
+
+C<set gdb_reflect_max_depth> I<VALUE>
+
+=item *
+
+C<show gdb_reflect_max_depth>
+
+Set or show the maximum recursion depth.  Defaults to 5.  Example:
+
+        (gdb) set gdb_reflect_max_depth 2
+        (gdb) pr v
+        [
+            [ { ... }, { ... }, { ... } ], 
+            [ { ... }, { ... }, { ... } ], 
+            [ { ... }, { ... }, { ... } ]
+        ]
+
+=item *
+
+C<set gdb_reflect_max_width> I<VALUE>
+
+=item *
+
+C<show gdb_reflect_max_width>
+
+Set or show the maximum number of elements to show from a given
+container.  Defaults to 10.  Example:
+
+        (gdb) set gdb_reflect_max_width 2
+        (gdb) pr v                       
+        [
+          [ 11, 12, ... ], 
+          [ 21, 22, ... ], 
+          ...
+        ]
+
+=cut
+
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use Devel::GDB::Reflect;
+use Devel::GDB;
+use Term::ReadLine;
+
+#
+# Map from parameter name (e.g. gdb_reflect_indent) to a variable ref
+# (e.g. \$Devel::GDB::Reflect::INDENT)
+#
+sub get_var($)
+{
+	($_) = @_;
+
+	/^gdb_reflect_indent$/
+		and return \$Devel::GDB::Reflect::INDENT;
+
+	/^gdb_reflect_max_width$/
+		and return \$Devel::GDB::Reflect::MAX_WIDTH;
+
+	/^gdb_reflect_max_depth$/
+		and return \$Devel::GDB::Reflect::MAX_DEPTH;
+
+	return undef;
+}
+
+die unless @ARGV;
+
+my ($gdb, $bufs, $errs) = new Devel::GDB( -file => $ARGV[0] );
+my $reflector = new Devel::GDB::Reflect($gdb);
+
+my $IS_TTY      = -t STDIN;
+my $VERBOSE     = 1;
+
+print STDERR $bufs;
+
+if($errs)
+{
+	print STDERR $errs;
+	die "Failed to start GDB";
+}
+
+# Create a new ReadLine instance if we're reading from a TTY;
+# otherwise create a stub that behaves like ReadLine
+
+my $term;
+
+if($IS_TTY)
+{
+	$term = new Term::ReadLine 'gdbwrap';
+	my $rl_attribs = $term->Attribs;
+
+	$rl_attribs->{completion_function} =
+		sub {
+			my ($text, $line, $start) = @_;
+			my @gdb_completions = map { substr($_, $start) } $reflector->get_completions($line);
+			my @gdbpp_completions = ();
+
+			if($line =~ /^(set|show)\b/)
+			{
+				foreach('gdb_reflect_indent', 'gdb_reflect_max_width', 'gdb_reflect_max_depth')
+				{
+					push @gdbpp_completions, $_ if($_ =~ /^\Q$text\E/);
+				}
+			}
+
+			if($text eq $line)
+			{
+				foreach('print_r', 'pr')
+				{
+					push @gdbpp_completions, $_ if($_ =~ /^\Q$text\E/);
+				}
+			}
+
+			return (@gdb_completions, @gdbpp_completions);
+		};
+}
+else
+{
+	$term = new MessageMethod sub
+	{
+		my $arg = shift;
+
+		({
+			readline => sub
+			{
+				my $prompt = shift;
+				print STDERR $prompt if $VERBOSE;
+				defined($_ = <STDIN>) and chomp $_ or undef;
+				return $_;
+			}
+		}->{$arg} || sub { die "Unknown request: $arg" })->(@_);
+	};
+}
+
+my $prompt = '(gdb)';
+my $lastcmd = '';
+my $lasterror = '';
+
+for( ; defined($_ = $term->readline("$prompt ")) ; $lastcmd = $_ if /\S/ )
+{
+	print STDERR "$_\n"
+		if(!$IS_TTY && $VERBOSE);
+
+	s/^\s*//;
+	$_ = $lastcmd unless /\S/;
+	next unless /\S/;
+
+	if(/^(?:print_r|pr)\s+(.*)/)
+	{
+		$reflector->print($1);
+	}
+	elsif(/^(?:set)\s+(gdb_reflect_(?:indent|max_width|max_depth))\b(.*)/)
+	{
+		my $param = $1;
+		(my $value = $2) =~ s/\s//;
+
+		unless ($value =~ /./)
+		{
+			print STDERR "Parameter requires a value!\n";
+			next;
+		}
+
+		unless ($value =~ /[0-9]+/)
+		{
+			print STDERR "Number expected, got '$value'!\n";
+			next;
+		}
+
+		${get_var($param)} = $value;
+	}
+	elsif(/^(?:show)\s+(gdb_reflect_(?:indent|max_width|max_depth))\b/)
+	{
+		my $param = $1;
+		print STDERR "$param is " . ${get_var($param)} . "\n";
+	}
+	else
+	{
+		(my $result, $lasterror, $prompt) = $gdb->get($_);
+		print STDERR $result;
+		last if $lasterror;
+	}
+}
+
+if($lasterror eq '')
+{
+	# We got EOF on STDIN, so let's quit gdb gracefully
+	$gdb->get('quit');
+	print STDERR "\n";
+	exit 0;
+}
+
+die "Error: $lasterror"
+	unless $lasterror eq 'EOF';
